@@ -37,4 +37,3 @@ class RecordEncoder:
     @classmethod
     def total_record_size(cls, payload: bytes) -> int:
         return 4 + 4 + len(payload)
-

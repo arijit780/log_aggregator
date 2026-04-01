@@ -1,9 +1,9 @@
 import os
 import struct
 from dataclasses import dataclass
-from typing import Generator, Optional
+from typing import Callable, Generator, Optional
 
-from .record_encoder import RecordEncoder
+from ..formats import RecordEncoder
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,7 @@ class Segment:
         path: str,
         max_size_bytes: int,
         encoder: Optional[RecordEncoder] = None,
+        append_stage_hook: Optional[Callable[[str], None]] = None,
     ) -> None:
         if base_offset < 0:
             raise ValueError("base_offset must be non-negative")
@@ -30,8 +31,13 @@ class Segment:
         self.path = path
         self.max_size_bytes = max_size_bytes
         self.encoder = encoder if encoder is not None else RecordEncoder()
+        self._append_stage_hook = append_stage_hook
 
         self._f = None  # file handle (BinaryIO)
+
+    def _hook(self, stage: str) -> None:
+        if self._append_stage_hook is not None:
+            self._append_stage_hook(stage)
 
     def _open_for_append(self) -> None:
         if self._f is not None:
@@ -105,12 +111,38 @@ class Segment:
         if current_size + record_size > self.max_size_bytes:
             return False
 
-        header = self.encoder.encode_header(payload)
-        self._f.write(header)
-        self._f.write(payload)
-        # Always flush user-space buffers so that a returned ACK in ASYNC mode means
-        # "written to file / handed to OS", even though it is not durable until fsync.
+        # Staged write for failure injection (Week 4). Order: length → crc → payload.
+        self._hook("before_write")
+
+        length = len(payload)
+        crc = self.encoder.crc32_payload(payload)
+
+        self._f.write(struct.pack(">I", length))
         self._f.flush()
+        self._hook("after_length")
+
+        self._f.write(struct.pack(">I", crc))
+        self._f.flush()
+        self._hook("after_crc")
+
+        if len(payload) > 1:
+            split = len(payload) // 2
+            self._f.write(payload[:split])
+            self._f.flush()
+            self._hook("mid_payload")
+            self._f.write(payload[split:])
+        elif payload:
+            self._f.write(payload)
+            self._f.flush()
+            self._hook("mid_payload")
+        else:
+            # Empty payload still defines mid_payload as "between crc and after_write".
+            self._hook("mid_payload")
+
+        # Always flush user-space buffers so ASYNC ACK means bytes reached the OS
+        # (not necessarily durable until fsync).
+        self._f.flush()
+        self._hook("after_write")
         return True
 
     def recover(self) -> int:
@@ -250,4 +282,3 @@ class Segment:
                 yield payload
                 if remaining is not None:
                     remaining -= 1
-

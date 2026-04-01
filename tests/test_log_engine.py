@@ -3,7 +3,7 @@ import struct
 import unittest
 from tempfile import TemporaryDirectory
 
-from log_aggregator import Log, RecordEncoder
+from src import Log, RecordEncoder
 
 
 FILENAME_BASE_WIDTH = 20

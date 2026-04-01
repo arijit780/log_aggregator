@@ -5,7 +5,7 @@ import threading
 import unittest
 from tempfile import TemporaryDirectory
 
-from log_aggregator import DurabilityMode, Log
+from src import DurabilityMode, Log
 
 
 def _run_crash_script(*, repo_root: str, data_dir: str, script: str) -> None:
@@ -26,7 +26,7 @@ class TestDurabilityAndAckSemantics(unittest.TestCase):
             script = r"""
 import os
 import os as _os
-from wal import Log, DurabilityMode
+from src import Log, DurabilityMode
 
 data_dir = os.environ["WAL_DATA_DIR"]
 log = Log(
@@ -58,7 +58,7 @@ _os._exit(0)
             script = rf"""
 import os
 import os as _os
-from wal import Log, DurabilityMode
+from src import Log, DurabilityMode
 
 data_dir = os.environ["WAL_DATA_DIR"]
 log = Log(
@@ -134,7 +134,7 @@ _os._exit(0)
             script = rf"""
 import os
 import os as _os
-from wal import Log, DurabilityMode
+from src import Log, DurabilityMode
 
 data_dir = os.environ["WAL_DATA_DIR"]
 log = Log(

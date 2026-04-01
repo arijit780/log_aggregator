@@ -3,7 +3,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 
 class DurabilityMode(str, Enum):
@@ -29,6 +29,8 @@ class _Pending:
     path: str
     # For SYNC, the caller waits for this event to be set after fsync completes.
     ack_event: Optional[threading.Event]
+    # If set, the fsync batch failed and SYNC waiters must raise.
+    error: Optional[BaseException] = None
 
 
 class DurabilityManager:
@@ -52,6 +54,7 @@ class DurabilityManager:
         mode: DurabilityMode,
         fsync_interval_ms: int = 10,
         fsync_batch_records: int = 128,
+        fsync_stage_hook: Optional[Callable[[str], None]] = None,
     ) -> None:
         if fsync_interval_ms <= 0:
             raise ValueError("fsync_interval_ms must be > 0")
@@ -61,6 +64,7 @@ class DurabilityManager:
         self.mode = mode
         self.fsync_interval_ms = fsync_interval_ms
         self.fsync_batch_records = fsync_batch_records
+        self._fsync_stage_hook = fsync_stage_hook
 
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
@@ -95,17 +99,21 @@ class DurabilityManager:
         """
         if self.mode == DurabilityMode.SYNC:
             ev = threading.Event()
+            pending = _Pending(path=path, ack_event=ev, error=None)
             with self._cv:
-                self._pending.append(_Pending(path=path, ack_event=ev))
+                self._pending.append(pending)
                 # Wake the batcher in case it is sleeping on interval.
                 self._cv.notify()
             # Wait until fsync finishes for the batch that includes this append.
             ev.wait()
+            if pending.error is not None:
+                # Deterministic behavior: if we cannot fsync, we must not ACK durability.
+                raise RuntimeError("fsync failed in SYNC mode") from pending.error
             return
 
         if self.mode == DurabilityMode.ASYNC:
             with self._cv:
-                self._pending.append(_Pending(path=path, ack_event=None))
+                self._pending.append(_Pending(path=path, ack_event=None, error=None))
                 # Wake the batcher for throughput (still bounded by batching settings).
                 self._cv.notify()
             return
@@ -150,20 +158,28 @@ class DurabilityManager:
         if not batch:
             return
 
-        # fsync each distinct segment file once. This is group commit across records
-        # and works safely even if the writer closed/rolled segments, because we
-        # open the file at fsync time (no reliance on long-lived fds).
-        paths = sorted({p.path for p in batch})
-        for path in paths:
-            # Use r+b so fsync operates on the same file, and close immediately after.
-            with open(path, "r+b") as f:
-                f.flush()
-                os.fsync(f.fileno())
+        try:
+            if self._fsync_stage_hook is not None:
+                self._fsync_stage_hook("before_fsync")
+            # fsync each distinct segment file once. This is group commit across records
+            # and works safely even if the writer closed/rolled segments, because we
+            # open the file at fsync time (no reliance on long-lived fds).
+            paths = sorted({p.path for p in batch})
+            for path in paths:
+                # Use r+b so fsync operates on the same file, and close immediately after.
+                with open(path, "r+b") as f:
+                    f.flush()
+                    os.fsync(f.fileno())
 
-        self.fsync_batches_completed += 1
-
-        # ACK all SYNC waiters whose appends are now durable.
-        for p in batch:
-            if p.ack_event is not None:
-                p.ack_event.set()
-
+            if self._fsync_stage_hook is not None:
+                self._fsync_stage_hook("after_fsync")
+            self.fsync_batches_completed += 1
+            err: Optional[BaseException] = None
+        except BaseException as e:
+            # Never let the fsync thread die silently; propagate to SYNC waiters.
+            err = e
+        finally:
+            for p in batch:
+                if p.ack_event is not None:
+                    p.error = err
+                    p.ack_event.set()

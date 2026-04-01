@@ -3,8 +3,9 @@ import re
 import threading
 from typing import Optional
 
-from .record_encoder import RecordEncoder
-from .durability import DurabilityManager, DurabilityMode
+from ..durability import DurabilityManager, DurabilityMode
+from ..formats import RecordEncoder
+from ..testing.failure_injector import FailureInjector
 from .segment import Segment, SegmentInfo
 
 
@@ -17,7 +18,7 @@ class Log:
 
     Public API:
       - append(data: bytes) -> offset
-    """
+      """
 
     def __init__(
         self,
@@ -29,6 +30,7 @@ class Log:
         fsync_interval_ms: int = 10,
         fsync_batch_records: int = 128,
         encoder: RecordEncoder = RecordEncoder(),
+        failure_injector: Optional[FailureInjector] = None,
     ) -> None:
         if max_segment_size_bytes <= 0:
             raise ValueError("max_segment_size_bytes must be positive")
@@ -37,6 +39,13 @@ class Log:
         self.max_segment_size_bytes = max_segment_size_bytes
         self.filename_base_width = filename_base_width
         self.encoder = encoder
+        self._failure_injector = failure_injector
+        self._append_stage_hook = (
+            (lambda s: failure_injector.maybe_fire(s)) if failure_injector is not None else None
+        )
+        self._fsync_stage_hook = (
+            (lambda s: failure_injector.maybe_fire(s)) if failure_injector is not None else None
+        )
 
         os.makedirs(self.data_dir, exist_ok=True)
 
@@ -49,6 +58,7 @@ class Log:
             mode=durability_mode,
             fsync_interval_ms=fsync_interval_ms,
             fsync_batch_records=fsync_batch_records,
+            fsync_stage_hook=self._fsync_stage_hook,
         )
 
         self._startup_recover()
@@ -84,7 +94,9 @@ class Log:
                 path=self._segment_path(0),
                 max_size_bytes=self.max_segment_size_bytes,
                 encoder=self.encoder,
+                append_stage_hook=self._append_stage_hook,
             )
+            self._assert_recovery_prefix_invariant()
             return
 
         expected_base = 0
@@ -104,6 +116,7 @@ class Log:
                 path=info.path,
                 max_size_bytes=self.max_segment_size_bytes,
                 encoder=self.encoder,
+                append_stage_hook=self._append_stage_hook,
             )
             valid_count = seg.recover()
 
@@ -113,6 +126,23 @@ class Log:
 
         self._next_offset = next_offset
         self._active_segment = last_segment
+        self._assert_recovery_prefix_invariant()
+
+    def _assert_recovery_prefix_invariant(self) -> None:
+        """
+        After recovery, on-disk log must equal a prefix of logical records [0..next_offset-1].
+        """
+        payloads = self.read_all()
+        assert len(payloads) == self._next_offset, (
+            "recovery invariant: record count must match next_offset; "
+            f"got len={len(payloads)} next_offset={self._next_offset}"
+        )
+
+    def latest_record_offset(self) -> int:
+        """Last valid logical record index, or -1 if log is empty."""
+        if self._next_offset <= 0:
+            return -1
+        return self._next_offset - 1
 
     @property
     def next_offset(self) -> int:
@@ -130,6 +160,9 @@ class Log:
             raise TypeError("append(data) expects bytes-like")
         payload = bytes(data)
 
+        # Serialize the *write* to avoid record interleaving, but DO NOT hold the lock
+        # while waiting for fsync in SYNC mode. Releasing the lock allows other threads
+        # to enqueue their appends and enables group commit.
         with self._append_lock:
             if self._active_segment is None:
                 # Should not happen due to startup recovery.
@@ -138,6 +171,7 @@ class Log:
                     path=self._segment_path(self._next_offset),
                     max_size_bytes=self.max_segment_size_bytes,
                     encoder=self.encoder,
+                    append_stage_hook=self._append_stage_hook,
                 )
 
             offset = self._next_offset
@@ -150,19 +184,25 @@ class Log:
                     path=self._segment_path(offset),
                     max_size_bytes=self.max_segment_size_bytes,
                     encoder=self.encoder,
+                    append_stage_hook=self._append_stage_hook,
                 )
                 appended = self._active_segment.append(payload)
                 if not appended:
-                    # Should only happen if the record is larger than the segment limit.
                     raise RuntimeError("Failed to append after rolling")
 
-            # STRICT append flow:
-            #   SYNC  => write+flush -> fsync(batch) -> ACK
-            #   ASYNC => write+flush -> ACK -> fsync(batch later)
-            self._durability.on_append(path=self._active_segment.path)
-
+            seg_path = self._active_segment.path
             self._next_offset += 1
-            return offset
+
+        # STRICT append flow:
+        #   SYNC  => write+flush -> fsync(batch) -> ACK
+        #   ASYNC => write+flush -> ACK -> fsync(batch later)
+        #
+        # Cross-component note (Week 4): logical offset is assigned before fsync. If the
+        # process dies after ASYNC ACK but before fsync, restart + recovery shows only a
+        # prefix of records — read APIs never invent gaps; consumer commits are clamped
+        # to last readable offset (see ConsumerManager).
+        self._durability.on_append(path=seg_path)
+        return offset
 
     def read_all(self) -> list[bytes]:
         """
@@ -176,6 +216,7 @@ class Log:
                 path=info.path,
                 max_size_bytes=self.max_segment_size_bytes,
                 encoder=self.encoder,
+                append_stage_hook=self._append_stage_hook,
             )
             for p in seg.iter_payloads():
                 payloads.append(p)
@@ -193,4 +234,3 @@ class Log:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
