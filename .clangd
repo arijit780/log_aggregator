@@ -1,0 +1,6 @@
+# Resolve #include "log_storage/..." → include/log_storage/ (IDE / clangd)
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -I
+    - include

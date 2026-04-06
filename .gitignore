@@ -1,0 +1,7 @@
+/build/
+cmake-build-*/
+*.o
+a.out
+crash_simulation
+compile_commands.json
+.DS_Store
