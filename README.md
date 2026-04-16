@@ -27,8 +27,19 @@ cmake --build build
 
 Headers live under `include/log_storage/`, sources under `src/`.
 
+## Python (Week 2 — durability / ACK)
+
+Same on-disk record layout as the C++ library. From repo root:
+
+```bash
+PYTHONPATH=. python3 -m unittest tests.test_week2_durability -v
+```
+
+See `wal_py/durability_manager.py` (SYNC vs ASYNC, group commit) and `wal_py/durable_wal.py`.
+
 ## More detail
 
-For a compact full map of the codebase (format, invariants, file list), see **`AGENTS.md`**.
+- **Architecture diagrams (Mermaid):** [`docs/architecture.md`](docs/architecture.md)  
+- **Dense codebase map:** **`AGENTS.md`**
 
 For editor/clangd: `.clangd` and `compile_flags.txt` add `-I include`.

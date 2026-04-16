@@ -2,8 +2,8 @@
 
 **Stack:** C++17, POSIX `open/read/write/lseek/ftruncate`, namespace `log_storage`. **Include:** `-Iinclude` → `#include "log_storage/…"`. **IDE:** `.clangd` + `compile_flags.txt`. **CMake:** lib `log_storage` + exe `crash_simulation` (`CMAKE_EXPORT_COMPILE_COMMANDS ON`).
 
-## Non-goals (not in repo)
-Txn/WAL/commit, consumers, replication, partitions, `fsync` policy — storage + recovery only.
+## Non-goals (scope)
+Full broker, transactions, replication, consumer groups. **C++** layer: append + recovery only (no fsync/ACK modes). **Python `wal_py`:** adds explicit SYNC/ASYNC durability + tests; still not a full WAL txn system.
 
 ## On-disk record (little-endian)
 `[MAGIC u32][OFFSET u64][LENGTH u64][PAYLOAD ×LENGTH][CRC u32]`  
@@ -57,3 +57,9 @@ Or one-shot: `c++ -std=c++17 -Wall -Wextra -Werror -I include src/crc32.cpp src/
 
 ## Invariants (must hold)
 Strict prefix after recovery; deterministic scan (same file → same prefix); no skipping damaged records; writer never bumps offset before successful `write_all`.
+
+## Python `wal_py/` (Week 2 durability)
+- **record_format.py** — same bytes/CRC as C++; **recovery.py** — `recover()` + `scan_prefix_payloads()` (read-only scan).
+- **durability_manager.py** — `DurabilityMode.SYNC` (ACK after real `os.fsync`, group commit via pending `threading.Event` queue + batch drain) vs `ASYNC` (ACK after `write`, background fsync on interval or N writes). `fsync_hook` for tests (still must call real `os.fsync` inside hook unless replacing entirely).
+- **durable_wal.py** — `DurableWAL(path, mode)`: create file if missing, `recover()`, unbuffered `r+b`, attach `DurabilityManager`.
+- **Tests:** `tests/test_week2_durability.py` — `PYTHONPATH=. python3 -m unittest tests.test_week2_durability -v`
