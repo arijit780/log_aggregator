@@ -1,4 +1,4 @@
-#include "log_storage/crc32.hpp"
+#include "log_storage/crypto/crc32.hpp"
 
 #include <array>
 

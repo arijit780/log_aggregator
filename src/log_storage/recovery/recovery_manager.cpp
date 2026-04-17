@@ -1,6 +1,7 @@
-#include "log_storage/recovery_manager.hpp"
+#include "log_storage/recovery/recovery_manager.hpp"
 
-#include "log_storage/record_layout.hpp"
+#include "log_storage/format/record_decode_status.hpp"
+#include "log_storage/format/v1_binary_codec.hpp"
 
 #include <unistd.h>
 
@@ -9,13 +10,10 @@
 namespace log_storage {
 
 RecoveryManager::Result RecoveryManager::recover(int fd) {
-  /*
-   * Core recovery algorithm (authoritative):
-   * expected_offset starts at 0; last_valid_position marks end of last good byte.
-   * For each record: MAGIC must match; OFFSET must equal expected_offset; LENGTH
-   * bounded; PAYLOAD full; CRC present and matching. Any failure: STOP (never skip).
-   * Then truncate at last_valid_position so the file is exactly a strict prefix.
-   */
+  return recover(fd, default_v1_binary_codec());
+}
+
+RecoveryManager::Result RecoveryManager::recover(int fd, IRecordCodec const& codec) {
   if (::lseek(fd, 0, SEEK_SET) < 0) {
     throw std::runtime_error("RecoveryManager: lseek(SEEK_SET) failed");
   }
@@ -26,7 +24,7 @@ RecoveryManager::Result RecoveryManager::recover(int fd) {
   for (;;) {
     std::uint64_t end_pos = 0;
     const RecordDecodeStatus st =
-        try_decode_one_record(fd, expected_offset, end_pos, nullptr);
+        codec.try_decode_one_record(fd, expected_offset, end_pos, nullptr);
     if (st == RecordDecodeStatus::CleanEof) {
       break;
     }

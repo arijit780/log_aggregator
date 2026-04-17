@@ -1,7 +1,7 @@
-#include "log_storage/record_layout.hpp"
+#include "log_storage/format/v1_binary_codec.hpp"
 
-#include "log_storage/crc32.hpp"
-#include "log_storage/io_util.hpp"
+#include "log_storage/crypto/crc32.hpp"
+#include "log_storage/io/byte_io.hpp"
 
 #include <unistd.h>
 
@@ -9,8 +9,8 @@
 
 namespace log_storage {
 
-void encode_record(std::uint64_t offset, const void* payload, std::size_t payload_len,
-                   std::vector<std::uint8_t>& out) {
+void V1BinaryCodec::encode(std::uint64_t offset, const void* payload, std::size_t payload_len,
+                           std::vector<std::uint8_t>& out) const {
   const std::uint64_t len_u64 = static_cast<std::uint64_t>(payload_len);
   out.resize(kRecordOverhead + payload_len);
   std::uint8_t* base = out.data();
@@ -32,30 +32,15 @@ void encode_record(std::uint64_t offset, const void* payload, std::size_t payloa
 
 namespace {
 
-ssize_t read_once(int fd, void* buf, std::size_t n) {
-  return ::read(fd, buf, n);
-}
+ssize_t read_once(int fd, void* buf, std::size_t n) { return ::read(fd, buf, n); }
 
 }  // namespace
 
-RecordDecodeStatus try_decode_one_record(int fd, std::uint64_t expected_offset,
-                                         std::uint64_t& end_file_offset,
-                                         std::vector<std::uint8_t>* payload_out) {
-  /*
-   * Failure scenarios (explicit):
-   * 1) Crash during header write: MAGIC or OFFSET/LENGTH incomplete or wrong —
-   *    first short read or MAGIC/OFFSET check fails; we stop; last_valid truncates.
-   * 2) Crash during payload: LENGTH read ok but payload read short → Invalid.
-   * 3) Crash during CRC: payload ok, CRC bytes missing → Invalid.
-   * 4) Extra garbage at end: first garbage byte fails MAGIC or spills into
-   *    invalid OFFSET/LENGTH/CRC path → Invalid at that boundary; truncate removes.
-   * 5) Valid-looking misaligned data: we never hunt for MAGIC; if previous record
-   *    ended cleanly, we read next MAGIC from aligned position. If garbage starts
-   *    mid-stream without truncate, MAGIC mismatch or OFFSET != expected stops us.
-   */
-
+RecordDecodeStatus V1BinaryCodec::try_decode_one_record(int fd, std::uint64_t expected_offset,
+                                                        std::uint64_t& end_file_offset,
+                                                        std::vector<std::uint8_t>* payload_out) const {
   std::uint8_t magic_buf[kMagicBytes];
-  ssize_t r = read_once(fd, magic_buf, kMagicBytes);
+  const ssize_t r = read_once(fd, magic_buf, kMagicBytes);
   if (r == 0) {
     return RecordDecodeStatus::CleanEof;
   }
@@ -111,8 +96,7 @@ RecordDecodeStatus try_decode_one_record(int fd, std::uint64_t expected_offset,
     std::memcpy(crc_body.data() + kOffsetBytes + kLengthBytes, payload.data(),
                 static_cast<std::size_t>(length));
   }
-  const std::uint32_t crc_calc = crc32_compute(crc_body.data(), crc_body.size());
-  if (crc_calc != crc_file) {
+  if (crc32_compute(crc_body.data(), crc_body.size()) != crc_file) {
     return RecordDecodeStatus::Invalid;
   }
 
@@ -127,6 +111,11 @@ RecordDecodeStatus try_decode_one_record(int fd, std::uint64_t expected_offset,
   }
 
   return RecordDecodeStatus::Ok;
+}
+
+IRecordCodec const& default_v1_binary_codec() noexcept {
+  static const V1BinaryCodec kCodec;
+  return kCodec;
 }
 
 }  // namespace log_storage

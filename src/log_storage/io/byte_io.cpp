@@ -1,6 +1,5 @@
-#include "log_storage/io_util.hpp"
+#include "log_storage/io/byte_io.hpp"
 
-#include <cerrno>
 #include <unistd.h>
 
 namespace log_storage {
@@ -9,12 +8,12 @@ bool read_exact(int fd, void* buf, std::size_t n) {
   auto* p = static_cast<std::uint8_t*>(buf);
   std::size_t got = 0;
   while (got < n) {
-    ssize_t r = ::read(fd, p + got, n - got);
+    const ssize_t r = ::read(fd, p + got, n - got);
     if (r < 0) {
       return false;
     }
     if (r == 0) {
-      return false;  // EOF before n bytes → partial record / garbage tail
+      return false;
     }
     got += static_cast<std::size_t>(r);
   }
@@ -25,7 +24,7 @@ bool write_all(int fd, const void* buf, std::size_t n) {
   const auto* p = static_cast<const std::uint8_t*>(buf);
   std::size_t sent = 0;
   while (sent < n) {
-    ssize_t w = ::write(fd, p + sent, n - sent);
+    const ssize_t w = ::write(fd, p + sent, n - sent);
     if (w < 0) {
       return false;
     }

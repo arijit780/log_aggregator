@@ -1,65 +1,64 @@
 # log_aggregator — dense codebase map (@ this file to load context cheaply)
 
-**Stack:** C++17, POSIX `open/read/write/lseek/ftruncate`, namespace `log_storage`. **Include:** `-Iinclude` → `#include "log_storage/…"`. **IDE:** `.clangd` + `compile_flags.txt`. **CMake:** lib `log_storage` + exe `crash_simulation` (`CMAKE_EXPORT_COMPILE_COMMANDS ON`).
+**Stack:** C++17, POSIX I/O + `fsync`, `std::thread` / condition variables, namespace `log_storage`. **Include:** `-Iinclude` → `#include "log_storage/…"`. **IDE:** `.clangd` + `compile_flags.txt`. **CMake:** `log_storage` (Threads::Threads), `crash_simulation`, `durability_test` (`CMAKE_EXPORT_COMPILE_COMMANDS ON`).
+
+## Layout (extensibility)
+| Layer | Path | Plug in |
+|-------|------|---------|
+| **Format** | `include/log_storage/format/` | `IRecordCodec` — implement `encode` + `try_decode_one_record`; default `V1BinaryCodec` + `default_v1_binary_codec()`. |
+| **I/O** | `include/log_storage/io/` | `byte_io.hpp` — `read_exact`, `write_all`, LE pack/unpack. |
+| **Crypto** | `include/log_storage/crypto/` | `crc32.hpp` — used by codecs. |
+| **Recovery** | `include/log_storage/recovery/` | `RecoveryManager::recover(fd)` or `recover(fd, codec)` — must use same codec as writer. |
+| **Durability** | `include/log_storage/durability/` | `DurabilityMode`, `DurabilityManager` + `Config` (`record_codec` optional ptr). |
+| **Writer / Reader** | `include/log_storage/writer/`, `reader/` | `LogWriter`, `DurableLogWriter`, `LogReader` — optional `IRecordCodec const*` ctor arg (`optional_codec`); default V1. |
+| **Umbrella** | `include/log_storage/log_storage.hpp` | Single include for public API. |
+| **How to extend** | `docs/EXTENSION.md` | New formats, backends, durability policies. |
 
 ## Non-goals (scope)
-Full broker, transactions, replication, consumer groups. **C++** layer: append + recovery only (no fsync/ACK modes). **Python `wal_py`:** adds explicit SYNC/ASYNC durability + tests; still not a full WAL txn system.
+Full broker, transactions, replication, consumer groups. No Python runtime in-tree.
 
-## On-disk record (little-endian)
-`[MAGIC u32][OFFSET u64][LENGTH u64][PAYLOAD ×LENGTH][CRC u32]`  
-- `MAGIC = 0x0A15E10D` (`kRecordMagic`, note LE on disk).  
-- `OFFSET` = 0,1,2… logical id; must equal scanner’s `expected` or **Invalid**.  
-- `LENGTH` ≤ `kMaxPayloadBytes` (=16MiB) or **Invalid**.  
-- **CRC32** (`crc32.cpp`, poly IEEE Ethernet style): over bytes = `pack_le_64(OFFSET)‖pack_le_64(LENGTH)‖PAYLOAD` (same layout as `encode_record` builds for CRC body).  
-- Overhead: `kRecordOverhead = 4+8+8+4` + payload.
+## On-disk record — V1 (`format/v1_constants.hpp` + `V1BinaryCodec`)
+`[MAGIC u32][OFFSET u64][LENGTH u64][PAYLOAD ×LENGTH][CRC u32]` (LE scalars). CRC over `OFFSET‖LENGTH‖PAYLOAD` bytes. **`kMaxPayloadBytes`** = 16MiB.
 
-**Integrity:** MAGIC = record boundary; OFFSET = global chain (no skip/resync); CRC = bytes for that triple. CRC-only bad: wrong start byte can yield wrong triple that still “checks” — need MAGIC+OFFSET. Long rationale: `record_format.hpp` comments.
+**Integrity:** MAGIC + OFFSET chain + CRC (CRC alone insufficient — see design notes in `docs/EXTENSION.md` / git history).
 
-## Single decode path (`record_layout.cpp`)
-`try_decode_one_record(fd, expected_offset, end_file_offset, payload_out|null)` → `CleanEof` | `Invalid` | `Ok`.  
-Flow: read 4 MAGIC (`read` once; `0` bytes ⇒ `CleanEof`; `<4` ⇒ `Invalid`); MAGIC match; `read_exact` OFFSET, LENGTH; `rec_off==expected`; LENGTH bound; `read_exact` payload; `read_exact` CRC; recompute CRC vs file. On `Ok`, `end_file_offset` = `lseek(SEEK_CUR)`.  
-Failure modes (torn header/payload/CRC, garbage tail, misalign): first failed check **Invalid**; caller uses last good `end_pos` and truncates.
+## Decode path (`IRecordCodec::try_decode_one_record`)
+Same flow as before: MAGIC → OFFSET/LENGTH → payload → CRC; `CleanEof` | `Invalid` | `Ok`. First failure **Invalid**; recovery truncates at last good end.
 
-## Recovery (`recovery_manager.cpp`)
-`RecoveryManager::recover(fd)`: `lseek` 0; `expected=0`, `last_valid=0`; loop `try_decode_one_record(..., nullptr)`; on `Ok` set `last_valid=end_pos`, `expected++`; on `CleanEof`/`Invalid` break; **`ftruncate(fd, last_valid)`**; `lseek` END; return `{next_offset=expected, truncated_bytes=last_valid}`. Throws on `lseek`/`ftruncate` error.
+## Recovery (`recovery/recovery_manager.cpp`)
+`recover(fd)` delegates to **`recover(fd, default_v1_binary_codec())`**. Loop uses **`codec.try_decode_one_record`**; then **`ftruncate`**, `lseek` END.
 
-## Writer (`log_writer.cpp` / `.hpp`)
-Ctor: `O_RDWR|O_CREAT`, then **`recover(fd)`**, `next_offset_=result.next_offset`.  
-`append(payload,len)`: reject `len>kMaxPayloadBytes`; `assigned=next_offset_`; `encode_record` → **`write_all`** full buffer; **then** `++next_offset_`. Optimistic: successful return ≠ durable until OS/storage says so; reopen may truncate suffix.
+## Writer (`writer/log_writer.cpp`)
+`open` → **`recover(fd_, codec())`** → append uses **`codec().encode`** + **`write_all`**. Ctor param **`optional_codec`** (must not shadow method `codec()` — use distinct name).
 
-## Reader (`log_reader.cpp` / `.hpp`)
-`O_RDONLY`, `lseek` 0, `expected_offset_=0`.  
-`read_next(payload)`: `try_decode_one_record(..., &payload)`; `CleanEof`→false; `Invalid`→throw; else `++expected_offset_` (after decode, matches internal counter with record’s OFFSET) → true.
+## Durability (`durability/durability_manager.cpp`)
+**Sync:** write under mutex → `promise` queue → worker batch `fsync` → `set_value`. **Async:** return after write; background `fsync`. **`Config::fsync_hook`** for tests (call real `fsync` inside).
 
-## IO / utils
-`io_util.cpp`: `read_exact`, `write_all`, `pack_le_u32/u64`, `unpack_le_u32/u64`.
+## Reader (`reader/log_reader.cpp`)
+Uses injected **`codec().try_decode_one_record`**; no truncate.
 
 ## File inventory
 | Path | Role |
 |------|------|
-| `include/log_storage/record_format.hpp` | constants, size caps, long design comments |
-| `include/log_storage/record_layout.hpp` | `encode_record`, `try_decode_one_record`, `RecordDecodeStatus` |
-| `src/record_layout.cpp` | encode/decode impl |
-| `include/log_storage/recovery_manager.hpp` | `RecoveryManager::recover` |
-| `src/recovery_manager.cpp` | scan + truncate |
-| `include/log_storage/log_writer.hpp` / `src/log_writer.cpp` | append + open recovery |
-| `include/log_storage/log_reader.hpp` / `src/log_reader.cpp` | sequential read |
-| `include/log_storage/io_util.hpp` / `src/io_util.cpp` | I/O + LE |
-| `include/log_storage/crc32.hpp` / `src/crc32.cpp` | CRC32 |
-| `tests/crash_simulation.cpp` | corrupt tail test; fork child appends, parent SIGKILL, reopen + verify contiguous offsets |
-| `CMakeLists.txt` | targets + export compile DB |
+| `format/irecord_codec.hpp` | Pluggable encode/decode interface |
+| `format/record_decode_status.hpp` | `RecordDecodeStatus` |
+| `format/v1_constants.hpp` | V1 MAGIC, sizes, caps |
+| `format/v1_binary_codec.hpp` / `src/log_storage/format/v1_binary_codec.cpp` | Default codec |
+| `io/byte_io.hpp` / `src/log_storage/io/byte_io.cpp` | POSIX byte I/O + LE |
+| `crypto/crc32.hpp` / `src/log_storage/crypto/crc32.cpp` | CRC32 |
+| `recovery/recovery_manager.hpp` / `src/log_storage/recovery/recovery_manager.cpp` | Scan + truncate |
+| `writer/log_writer.hpp` / `src/log_storage/writer/log_writer.cpp` | Optimistic append |
+| `writer/durable_log_writer.hpp` / `src/log_storage/writer/durable_log_writer.cpp` | Recovery + durability |
+| `durability/durability_mode.hpp`, `durability/durability_manager.hpp` / `src/.../durability_manager.cpp` | SYNC/ASYNC |
+| `reader/log_reader.hpp` / `src/log_storage/reader/log_reader.cpp` | Sequential read |
+| `log_storage.hpp` | Umbrella include |
+| `tests/crash_simulation.cpp`, `tests/durability_test.cpp` | Tests |
+| `CMakeLists.txt` | `find_package(Threads)`, `src/log_storage/**` sources |
 
 ## Build / run
 ```bash
-cmake -S . -B build && cmake --build build && ./build/crash_simulation
+cmake -S . -B build && cmake --build build && ./build/crash_simulation && ./build/durability_test
 ```
-Or one-shot: `c++ -std=c++17 -Wall -Wextra -Werror -I include src/crc32.cpp src/io_util.cpp src/record_layout.cpp src/recovery_manager.cpp src/log_writer.cpp src/log_reader.cpp tests/crash_simulation.cpp -o crash_simulation`
 
 ## Invariants (must hold)
-Strict prefix after recovery; deterministic scan (same file → same prefix); no skipping damaged records; writer never bumps offset before successful `write_all`.
-
-## Python `wal_py/` (Week 2 durability)
-- **record_format.py** — same bytes/CRC as C++; **recovery.py** — `recover()` + `scan_prefix_payloads()` (read-only scan).
-- **durability_manager.py** — `DurabilityMode.SYNC` (ACK after real `os.fsync`, group commit via pending `threading.Event` queue + batch drain) vs `ASYNC` (ACK after `write`, background fsync on interval or N writes). `fsync_hook` for tests (still must call real `os.fsync` inside hook unless replacing entirely).
-- **durable_wal.py** — `DurableWAL(path, mode)`: create file if missing, `recover()`, unbuffered `r+b`, attach `DurabilityManager`.
-- **Tests:** `tests/test_week2_durability.py` — `PYTHONPATH=. python3 -m unittest tests.test_week2_durability -v`
+Strict prefix after recovery; deterministic scan; no skipping damaged records; writer never bumps offset before successful `write_all`. **Sync:** no `set_value` until after batch `fsync`.

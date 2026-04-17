@@ -1,6 +1,6 @@
-#include "log_storage/io_util.hpp"
-#include "log_storage/log_reader.hpp"
-#include "log_storage/log_writer.hpp"
+#include "log_storage/io/byte_io.hpp"
+#include "log_storage/reader/log_reader.hpp"
+#include "log_storage/writer/log_writer.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
