@@ -4,6 +4,13 @@
 
 namespace log_storage {
 
+// Thin wrappers around POSIX read/write that:
+// - handle short reads/writes by looping, and
+// - expose a simple boolean "all bytes transferred" contract to higher layers.
+//
+// The record codec + recovery logic relies on these helpers to distinguish:
+// - clean EOF (no bytes) vs
+// - partial/torn record tails (short transfer), which are treated as Invalid and truncated away.
 bool read_exact(int fd, void* buf, std::size_t n) {
   auto* p = static_cast<std::uint8_t*>(buf);
   std::size_t got = 0;
@@ -43,6 +50,8 @@ void pack_le_u32(std::uint8_t* out, std::uint32_t v) {
   out[3] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
 }
 
+// Pack/unpack helpers make the on-disk format explicitly little-endian.
+// This avoids depending on host endianness or alignment when reading raw bytes.
 void pack_le_u64(std::uint8_t* out, std::uint64_t v) {
   for (int i = 0; i < 8; ++i) {
     out[i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFu);

@@ -1,6 +1,6 @@
 #include "log_storage/durability/durability_mode.hpp"
 #include "log_storage/reader/log_reader.hpp"
-#include "log_storage/writer/durable_log_writer.hpp"
+#include "log_storage/writer/log_writer.hpp"
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -16,10 +16,14 @@
 
 namespace {
 
-using log_storage::DurableLogWriter;
+// These tests focus on the durability modes exposed by LogWriter::append(payload, mode):
+// - Sync: append blocks until a batched fsync covers the write (group commit)
+// - Async: append returns after write(); background fsync happens periodically/by threshold
+// - None: append returns after write() with no fsync policy (covered by crash_simulation)
 using log_storage::DurabilityManager;
 using log_storage::DurabilityMode;
 using log_storage::LogReader;
+using log_storage::LogWriter;
 
 std::string make_tmp_wal() {
   char tmpl[] = "/tmp/dur_test_XXXXXX";
@@ -34,12 +38,11 @@ std::string make_tmp_wal() {
 void test_sync_readback() {
   const std::string path = make_tmp_wal();
   DurabilityManager::Config cfg;
-  cfg.mode = DurabilityMode::Sync;
   cfg.sync_batch_max_records = 1;
   cfg.sync_batch_interval_ms = 99999.0;
   {
-    DurableLogWriter w(path, cfg);
-    w.append(std::vector<std::uint8_t>{'d', 'a', 't', 'a'});
+    LogWriter w(path, cfg);
+    w.append(std::vector<std::uint8_t>{'d', 'a', 't', 'a'}, DurabilityMode::Sync);
     if (w.fsync_count() < 1u) {
       throw std::runtime_error("expected at least one fsync in SYNC");
     }
@@ -61,12 +64,11 @@ void test_sync_readback() {
 void test_group_commit_fewer_fsync_than_appends() {
   const std::string path = make_tmp_wal();
   DurabilityManager::Config cfg;
-  cfg.mode = DurabilityMode::Sync;
   cfg.sync_batch_max_records = 5;
   cfg.sync_batch_interval_ms = 2000.0;
   std::uint64_t fsyncs = 0;
   {
-    DurableLogWriter w(path, cfg);
+    LogWriter w(path, cfg);
     std::atomic<int> go{0};
     auto job = [&](int id) {
       while (go.load() == 0) {
@@ -74,7 +76,7 @@ void test_group_commit_fewer_fsync_than_appends() {
       }
       for (int j = 0; j < 5; ++j) {
         std::vector<std::uint8_t> p = {'k', static_cast<std::uint8_t>(id), static_cast<std::uint8_t>(j)};
-        w.append(p);
+        w.append(p, DurabilityMode::Sync);
       }
     };
     std::thread t0(job, 0);
@@ -96,7 +98,6 @@ void test_group_commit_fewer_fsync_than_appends() {
 void test_fsync_hook() {
   const std::string path = make_tmp_wal();
   DurabilityManager::Config cfg;
-  cfg.mode = DurabilityMode::Sync;
   cfg.sync_batch_max_records = 2;
   cfg.sync_batch_interval_ms = 50.0;
   int calls = 0;
@@ -107,9 +108,9 @@ void test_fsync_hook() {
     }
   };
   {
-    DurableLogWriter w(path, cfg);
-    w.append(std::vector<std::uint8_t>{1});
-    w.append(std::vector<std::uint8_t>{2});
+    LogWriter w(path, cfg);
+    w.append(std::vector<std::uint8_t>{1}, DurabilityMode::Sync);
+    w.append(std::vector<std::uint8_t>{2}, DurabilityMode::Sync);
   }
   if (calls < 1) {
     throw std::runtime_error("fsync_hook not invoked");
@@ -120,18 +121,17 @@ void test_fsync_hook() {
 void test_async_ordering_after_recover() {
   const std::string path = make_tmp_wal();
   DurabilityManager::Config cfg;
-  cfg.mode = DurabilityMode::Async;
   cfg.async_flush_max_records = 4;
   cfg.async_flush_interval_ms = 20.0;
   {
-    DurableLogWriter w(path, cfg);
+    LogWriter w(path, cfg);
     for (int i = 0; i < 12; ++i) {
-      w.append(std::vector<std::uint8_t>{static_cast<std::uint8_t>(i)});
+      w.append(std::vector<std::uint8_t>{static_cast<std::uint8_t>(i)}, DurabilityMode::Async);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
   }
   {
-    DurableLogWriter w2(path, cfg);
+    LogWriter w2(path, cfg);
     (void)w2;
   }
   LogReader r(path);
@@ -155,11 +155,10 @@ void test_fork_sync_child_survives() {
   if (pid == 0) {
     try {
       DurabilityManager::Config cfg;
-      cfg.mode = DurabilityMode::Sync;
       cfg.sync_batch_max_records = 1;
       cfg.sync_batch_interval_ms = 99999.0;
-      DurableLogWriter w(path, cfg);
-      w.append(std::vector<std::uint8_t>{'x'});
+      LogWriter w(path, cfg);
+      w.append(std::vector<std::uint8_t>{'x'}, DurabilityMode::Sync);
       _exit(0);
     } catch (...) {
       _exit(2);

@@ -11,6 +11,8 @@
 
 namespace log_storage {
 
+// DurableLogWriter is kept for backward compatibility with the earlier API.
+// New code should prefer LogWriter and pass DurabilityMode per append() call.
 DurableLogWriter::DurableLogWriter(std::string path, DurabilityManager::Config config)
     : path_(std::move(path)) {
   fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
@@ -64,7 +66,8 @@ std::uint64_t DurableLogWriter::append(const std::vector<std::uint8_t>& payload)
 }
 
 std::uint64_t DurableLogWriter::append(const void* payload, std::size_t len) {
-  return dm_->append(payload, len);
+  // Back-compat: DurableLogWriter always behaves like Sync by default.
+  return dm_->append(payload, len, DurabilityMode::Sync);
 }
 
 std::uint64_t DurableLogWriter::next_offset() const { return dm_->next_offset(); }

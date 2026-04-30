@@ -21,6 +21,12 @@
 
 namespace {
 
+// This test simulates process crashes while appending.
+//
+// The important contract being exercised:
+// - Writes can be torn/truncated due to SIGKILL at any time.
+// - On reopen, recovery truncates the suffix so the durable state is a strict prefix of valid records.
+// - Reader must then observe a contiguous sequence of offsets starting at 0.
 std::string temp_log_path() {
   std::string p = "/tmp/log_crash_XXXXXX";
   std::vector<char> buf(p.begin(), p.end());
@@ -79,7 +85,7 @@ void append_until_killed(const std::string& path) {
   std::vector<std::uint8_t> payload;
   for (std::uint64_t i = 0;; ++i) {
     make_payload(i, payload);
-    w.append(payload);
+    w.append(payload);  // DurabilityMode::None: rely on crash recovery to truncate torn tail.
     if ((i & 0x3FFu) == 0u) {
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     }

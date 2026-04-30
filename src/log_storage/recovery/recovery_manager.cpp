@@ -9,10 +9,23 @@
 
 namespace log_storage {
 
+/// Delegate to codec-specific recovery using the default V1 codec.
 RecoveryManager::Result RecoveryManager::recover(int fd) {
   return recover(fd, default_v1_binary_codec());
 }
 
+/// Scan from start of file: decode records in order until EOF or first invalid frame.
+///
+/// Recovery is the authority for what is considered "durable state" after a crash.
+///
+/// Flow:
+/// - Seek to byte 0.
+/// - Repeatedly ask the codec to decode the next record at the expected logical offset.
+/// - Stop at the first CleanEof (normal) or Invalid (torn tail / garbage / misalignment).
+/// - Truncate the file to the last known-good record boundary and seek to end.
+///
+/// Invariant we enforce: after recovery, the file is a strict prefix of valid records with contiguous
+/// logical offsets (0,1,2,...) — no skipping, no resync after damage.
 RecoveryManager::Result RecoveryManager::recover(int fd, IRecordCodec const& codec) {
   if (::lseek(fd, 0, SEEK_SET) < 0) {
     throw std::runtime_error("RecoveryManager: lseek(SEEK_SET) failed");

@@ -20,7 +20,6 @@ namespace log_storage {
 class DurabilityManager {
  public:
   struct Config {
-    DurabilityMode mode = DurabilityMode::Sync;
     std::size_t sync_batch_max_records = 16;
     double sync_batch_interval_ms = 10.0;
     std::size_t async_flush_max_records = 32;
@@ -36,7 +35,7 @@ class DurabilityManager {
   DurabilityManager& operator=(DurabilityManager&&) = delete;
   ~DurabilityManager();
 
-  std::uint64_t append(const void* payload, std::size_t len);
+  std::uint64_t append(const void* payload, std::size_t len, DurabilityMode mode);
 
   void shutdown();
 
@@ -49,8 +48,7 @@ class DurabilityManager {
 
  private:
   void do_fsync();
-  void sync_commit_loop();
-  void async_flush_loop();
+  void commit_loop();
   IRecordCodec const& codec() const;
 
   int fd_;
@@ -61,8 +59,7 @@ class DurabilityManager {
   std::atomic<std::uint64_t> fsync_count_{0};
 
   mutable std::mutex mu_;
-  std::condition_variable sync_cv_;
-  std::condition_variable async_cv_;
+  std::condition_variable cv_;
   std::deque<std::unique_ptr<std::promise<void>>> sync_pending_;
 
   std::size_t writes_since_fsync_ = 0;

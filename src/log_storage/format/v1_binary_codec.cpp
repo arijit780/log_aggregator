@@ -9,8 +9,22 @@
 
 namespace log_storage {
 
+// V1BinaryCodec defines the on-disk framing and validation rules for a single record.
+//
+// Encode flow:
+// - write MAGIC + OFFSET + LENGTH (little-endian)
+// - copy PAYLOAD
+// - compute CRC over OFFSET‖LENGTH‖PAYLOAD (not MAGIC) and append it
+//
+// Decode flow (strict, no resync):
+// - read MAGIC once (clean EOF vs partial/torn tail)
+// - read OFFSET/LENGTH, ensure OFFSET == expected_offset and LENGTH <= max
+// - read PAYLOAD + CRC, recompute CRC and compare
+// - on success, report end_file_offset so recovery can truncate precisely
 void V1BinaryCodec::encode(std::uint64_t offset, const void* payload, std::size_t payload_len,
                            std::vector<std::uint8_t>& out) const {
+  // CRC is computed over the logical fields (OFFSET‖LENGTH‖PAYLOAD), not including MAGIC.
+  // MAGIC is for boundary detection/resync; OFFSET provides the "no gaps" chain invariant.
   const std::uint64_t len_u64 = static_cast<std::uint64_t>(payload_len);
   out.resize(kRecordOverhead + payload_len);
   std::uint8_t* base = out.data();
@@ -39,6 +53,9 @@ ssize_t read_once(int fd, void* buf, std::size_t n) { return ::read(fd, buf, n);
 RecordDecodeStatus V1BinaryCodec::try_decode_one_record(int fd, std::uint64_t expected_offset,
                                                         std::uint64_t& end_file_offset,
                                                         std::vector<std::uint8_t>* payload_out) const {
+  // We intentionally do a single read for MAGIC:
+  // - 0 bytes => clean EOF (no partial record)
+  // - short read => invalid/torn tail (recovery will truncate to last known-good record)
   std::uint8_t magic_buf[kMagicBytes];
   const ssize_t r = read_once(fd, magic_buf, kMagicBytes);
   if (r == 0) {

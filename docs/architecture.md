@@ -4,16 +4,22 @@ Mermaid diagrams below render in GitHub, VS Code Markdown preview, and many othe
 
 ## Suggested reading order
 
-1. `include/log_storage/format/irecord_codec.hpp` — pluggable framing contract  
-2. `include/log_storage/format/v1_constants.hpp` + `format/v1_binary_codec.hpp` — default on-disk layout  
-3. `src/log_storage/recovery/recovery_manager.cpp` — scan, stop at first invalid, `ftruncate`  
-4. `src/log_storage/writer/log_writer.cpp` — open → recover → append  
-5. `src/log_storage/durability/durability_manager.cpp` + `writer/durable_log_writer.cpp` — Week 2 SYNC/ASYNC  
-6. `src/log_storage/reader/log_reader.cpp` — sequential read  
+### Week 1-2 (single-file log)
+1. `include/log_storage/format/irecord_codec.hpp` — pluggable framing contract
+2. `include/log_storage/format/v1_constants.hpp` + `format/v1_binary_codec.hpp` — default on-disk layout
+3. `src/log_storage/recovery/recovery_manager.cpp` — scan, stop at first invalid, `ftruncate`
+4. `src/log_storage/writer/log_writer.cpp` — open → recover → append
+5. `src/log_storage/durability/durability_manager.cpp` + `writer/durable_log_writer.cpp` — SYNC/ASYNC
 
-See **`docs/EXTENSION.md`** for adding a new codec or backend.
+### Week 3-4 (segment-based log)
+1. `include/log_storage/storage/record.hpp` — wire format `[length][payload][crc32]`
+2. `src/log_storage/storage/segment.cpp` — file-level operations
+3. `src/log_storage/storage/recovery.cpp` — scan + truncate (single function)
+4. `src/log_storage/storage/durability.cpp` — Sync / Async guard
+5. `src/log_storage/storage/log.cpp` — segment management + append/read
+6. `src/log_storage/consumer/offset_store.cpp` — `(group, partition) → offset`
 
-## Components and dependencies
+## Week 1-2 components
 
 ```mermaid
 flowchart TB
@@ -24,7 +30,6 @@ flowchart TB
 
   subgraph public_api["Public API"]
     W[LogWriter]
-    DW[DurableLogWriter]
     DM[DurabilityManager]
     R[LogReader]
     M[RecoveryManager]
@@ -46,9 +51,8 @@ flowchart TB
 
   T --> W
   T --> R
-  DT --> DW
-  DW --> DM
-  DW --> M
+  DT --> W
+  W --> DM
   W --> M
   W --> IC
   R --> IC
@@ -65,60 +69,132 @@ flowchart TB
   DM --> IC
   DM --> IO
   DM --> FS
-  DW --> FS
 ```
 
-## Append vs recovery vs read
+## Week 3-4 components
+
+```mermaid
+flowchart TB
+  subgraph tests["Tests"]
+    RT[tests/recovery_tests.cpp]
+    DTT[tests/durability_tests.cpp]
+  end
+
+  subgraph api["Segment-based API"]
+    LOG[Log]
+    DG[DurabilityGuard]
+    REC[recover_segment]
+  end
+
+  subgraph record["Record layer"]
+    ENC[encode_record]
+    DEC[decode_record]
+  end
+
+  subgraph consumer["Consumer"]
+    OS[OffsetStore]
+  end
+
+  subgraph shared["Shared utilities"]
+    IO[io/byte_io]
+    CRC[crypto/crc32]
+  end
+
+  subgraph disk["OS"]
+    SEG[(Segment files)]
+    META[(Metadata log)]
+  end
+
+  RT --> LOG
+  RT --> OS
+  DTT --> LOG
+  LOG --> DG
+  LOG --> REC
+  LOG --> ENC
+  LOG --> DEC
+  REC --> DEC
+  OS --> ENC
+  OS --> DEC
+  ENC --> CRC
+  ENC --> IO
+  DEC --> CRC
+  DEC --> IO
+  LOG --> SEG
+  OS --> META
+  DG --> SEG
+  REC --> SEG
+```
+
+## Week 3-4 on-disk record format
 
 ```mermaid
 flowchart LR
-  subgraph write["Append optimistic"]
-    A1[next_offset_] --> A2[IRecordCodec::encode]
-    A2 --> A3[write_all]
-    A3 --> A4[++next_offset_]
-  end
-
-  subgraph recover["Recovery authoritative"]
-    B1[lseek 0] --> B2[codec.try_decode loop]
-    B2 --> B3[CleanEof or Invalid: stop]
-    B3 --> B4[ftruncate last_valid]
-    B4 --> B5[next_offset = count]
-  end
-
-  subgraph readpath["Read no truncate"]
-    C1[codec.try_decode_one_record] --> C2[Ok: payload]
-    C1 --> C3[Invalid: throw]
-  end
+  LEN["uint32 length<br/>(LE)"] --> PL["payload<br/>(length bytes)"] --> CRC["uint32 crc32<br/>(LE)"]
 ```
 
-## On-disk record (V1, strict byte order, little-endian scalars)
+CRC covers `length_bytes ‖ payload_bytes` — protects both the length value and payload content.
 
-```mermaid
-flowchart LR
-  MG[MAGIC u32] --> OF[OFFSET u64] --> LN[LENGTH u64] --> PL[PAYLOAD × LENGTH] --> CR[CRC u32]
-```
-
-## Open DurableLogWriter: recovery then durability threads
+## Segment-based log lifecycle
 
 ```mermaid
 sequenceDiagram
   participant App
-  participant DurableLogWriter
+  participant Log
+  participant Segment
   participant Recovery
-  participant Codec as IRecordCodec
+  participant DurabilityGuard
   participant Disk
 
-  App->>DurableLogWriter: open path + config
-  DurableLogWriter->>Disk: open O_RDWR CREAT
-  DurableLogWriter->>Recovery: recover fd optional codec
-  Recovery->>Disk: lseek 0
-  loop each record
-    Recovery->>Codec: try_decode_one_record
-    Codec->>Disk: read validate
-    Codec-->>Recovery: Ok / CleanEof / Invalid
-  end
-  Recovery->>Disk: ftruncate last_valid
-  Recovery-->>DurableLogWriter: next_offset
-  App->>DurableLogWriter: append payload
-  DurableLogWriter->>Disk: write full record
+  App->>Log: Log(config)
+  Log->>Disk: scan dir for .seg files
+  Log->>Segment: segment_open(last)
+  Log->>Recovery: recover_segment(seg)
+  Recovery->>Segment: segment_read_at(0, all)
+  Recovery->>Recovery: decode records in loop
+  Recovery->>Segment: segment_truncate(valid_pos)
+  Recovery-->>Log: RecoveryResult
+  Log->>DurabilityGuard: new(fd, config)
+
+  App->>Log: append(payload)
+  Log->>Log: encode_record(payload)
+  Log->>Segment: segment_append(wire)
+  Log->>DurabilityGuard: after_write()
+  Note over DurabilityGuard: Sync: fsync now<br/>Async: mark dirty
+  DurabilityGuard-->>Log: return
+  Log-->>App: byte_offset
 ```
+
+## Consumer offset store lifecycle
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant OffsetStore
+  participant Disk
+
+  App->>OffsetStore: OffsetStore(path)
+  OffsetStore->>Disk: open metadata log
+  OffsetStore->>OffsetStore: recover(): scan all records
+  Note over OffsetStore: Rebuild (group,partition)→offset map<br/>Last-writer-wins
+
+  App->>OffsetStore: commit("group-a", 0, 1500)
+  OffsetStore->>OffsetStore: encode offset entry as record
+  OffsetStore->>Disk: write + fsync
+  Note over OffsetStore: Crash before fsync = commit lost<br/>(at-least-once semantics)
+  OffsetStore-->>App: return
+
+  App->>OffsetStore: get("group-a", 0)
+  OffsetStore-->>App: 1500
+```
+
+## Segment rolling
+
+```mermaid
+flowchart LR
+  A["active segment<br/>size > max"] --> B["shutdown DurabilityGuard<br/>(final fsync)"]
+  B --> C["segment_create<br/>(new file)"]
+  C --> D["new DurabilityGuard<br/>(new fd)"]
+```
+
+Crash between B and C: old segment fsynced, no new file. Safe.
+Crash during write to new segment: recovery truncates partial tail. Safe.
